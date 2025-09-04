@@ -1,0 +1,166 @@
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ibm.wala.classLoader.IMethod;
+import com.ibm.wala.classLoader.IClass;
+import com.ibm.wala.ipa.callgraph.*;
+import com.ibm.wala.ipa.callgraph.impl.Util;
+import com.ibm.wala.ipa.cha.ClassHierarchy;
+import com.ibm.wala.ipa.cha.ClassHierarchyException;
+import com.ibm.wala.ipa.cha.IClassHierarchy;
+import com.ibm.wala.ipa.cha.AnalysisScopeReader;
+import com.ibm.wala.ipa.cha.AnalysisScope;
+import com.ibm.wala.ipa.cha.AnalysisOptions;
+import com.ibm.wala.ipa.cha.AnalysisCacheImpl;
+import com.ibm.wala.util.config.FileOfClasses;
+import com.ibm.wala.util.io.FileProvider;
+import com.ibm.wala.types.MethodReference;
+import com.ibm.wala.types.Selector;
+import com.ibm.wala.ipa.callgraph.CallGraphBuilder;
+import com.ibm.wala.util.strings.Atom;
+import com.ibm.wala.classLoader.CallSiteReference;
+import com.ibm.wala.ipa.callgraph.impl.Everywhere;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
+
+public class CallGraphExporter {
+
+    // -------------------------
+    // Build call graph
+    // -------------------------
+    public static CallGraph buildCallGraph(String appJar, String depDir) throws Exception {
+        // Build scope from app jar + dependency jars
+        AnalysisScope scope = AnalysisScopeReader.makeJavaBinaryAnalysisScope(appJar, null);
+
+        File depFolder = new File(depDir);
+        if (depFolder.exists() && depFolder.isDirectory()) {
+            for (File f : Objects.requireNonNull(depFolder.listFiles())) {
+                if (f.getName().endsWith(".jar")) {
+                    scope.addToScope(ClassLoaderReference.Primordial, f);
+                }
+            }
+        }
+
+        // Add exclusions (skip JDK internals etc.)
+        File exclusionsFile = new FileProvider().getFile("Java60RegressionExclusions.txt");
+        scope.setExclusions(new FileOfClasses(exclusionsFile));
+
+        ClassHierarchy cha = ClassHierarchy.make(scope);
+
+        AnalysisOptions options = new AnalysisOptions(scope, null);
+        AnalysisCacheImpl cache = new AnalysisCacheImpl();
+
+        // 0-CFA builder
+        CallGraphBuilder<?> builder = Util.makeZeroCFABuilder(Language.JAVA, options, cache, cha, scope);
+        return builder.makeCallGraph(options, null);
+    }
+
+    // -------------------------
+    // Extract to Map
+    // -------------------------
+    public static Map<String, Set<String>> extractGraph(CallGraph cg, IClassHierarchy cha, String packagePrefix) {
+        Map<String, Set<String>> graph = new HashMap<>();
+
+        for (CGNode node : cg) {
+            String caller = formatMethod(node.getMethod());
+            if (!caller.startsWith(packagePrefix)) continue;
+
+            for (CallSiteReference site : node.iterateCallSites()) {
+                Set<CGNode> targets = cg.getPossibleTargets(node, site);
+
+                if (!targets.isEmpty()) {
+                    for (CGNode target : targets) {
+                        String callee = formatMethod(target.getMethod());
+                        if (callee.startsWith(packagePrefix)) {
+                            graph.computeIfAbsent(caller, k -> new HashSet<>()).add(callee);
+                        }
+                    }
+                } else {
+                    // expand interfaces if unresolved
+                    IClass declaredClass = cha.lookupClass(site.getDeclaredTarget().getDeclaringClass());
+                    if (declaredClass != null && declaredClass.isInterface()) {
+                        for (IClass impl : cha.getImplementors(declaredClass.getReference())) {
+                            IMethod implMethod = impl.getMethod(site.getDeclaredTarget().getSelector());
+                            if (implMethod != null) {
+                                String callee = formatMethod(implMethod);
+                                if (callee.startsWith(packagePrefix)) {
+                                    graph.computeIfAbsent(caller, k -> new HashSet<>()).add(callee);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return graph;
+    }
+
+    // -------------------------
+    // Format methods
+    // -------------------------
+    private static String formatMethod(IMethod m) {
+        return m.getDeclaringClass().getName().toString().replace('/', '.')
+                + "." + m.getName().toString()
+                + m.getDescriptor().toString();
+    }
+
+    // -------------------------
+    // Save graph to JSON
+    // -------------------------
+    public static void saveGraphToJson(Map<String, Set<String>> graph, String filePath) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.writerWithDefaultPrettyPrinter().writeValue(new File(filePath), graph);
+    }
+
+    // -------------------------
+    // Load graph from JSON
+    // -------------------------
+    public static Map<String, Set<String>> loadGraphFromJson(String filePath) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.readValue(new File(filePath), new TypeReference<Map<String, Set<String>>>(){});
+    }
+
+    // -------------------------
+    // Walk graph (DFS)
+    // -------------------------
+    public static void walk(Map<String, Set<String>> graph, String start, Set<String> visited) {
+        if (!visited.add(start)) return;
+        System.out.println(start);
+
+        for (String callee : graph.getOrDefault(start, Set.of())) {
+            walk(graph, callee, visited);
+        }
+    }
+
+    // -------------------------
+    // Main Example
+    // -------------------------
+    public static void main(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: java CallGraphExporter <appJar> <depDir> <packagePrefix>");
+            return;
+        }
+
+        String appJar = args[0];
+        String depDir = args[1];
+        String packagePrefix = args[2];  // e.g. "Lcom/company/"
+
+        CallGraph cg = buildCallGraph(appJar, depDir);
+        ClassHierarchy cha = (ClassHierarchy) cg.getClassHierarchy();
+
+        Map<String, Set<String>> graph = extractGraph(cg, cha, packagePrefix);
+        saveGraphToJson(graph, "callgraph.json");
+
+        System.out.println("✅ Call graph exported to callgraph.json");
+
+        // Example: load back and walk from some method
+        Map<String, Set<String>> loaded = loadGraphFromJson("callgraph.json");
+        System.out.println("\nWalking from first method:\n");
+        if (!loaded.isEmpty()) {
+            String start = loaded.keySet().iterator().next();
+            walk(loaded, start, new HashSet<>());
+        }
+    }
+}
