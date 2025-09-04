@@ -1,0 +1,29 @@
+public static Collection<Entrypoint> makeEntrypoints(
+            AnalysisScope scope,
+            ClassHierarchy cha,
+            String packagePrefix) {
+
+        List<Entrypoint> result = new ArrayList<>();
+
+        // iterate all classes in the Application loader
+        for (IClass cls : cha) {
+            if (!cls.getClassLoader().getReference().equals(ClassLoaderReference.Application)) {
+                continue; // skip primordial & extension classes
+            }
+
+            String className = cls.getName().toString().replace('/', '.');
+
+            // only keep classes in your package
+            if (!className.startsWith(packagePrefix)) {
+                continue;
+            }
+
+            // add each *public* method as an entry point
+            for (IMethod m : cls.getDeclaredMethods()) {
+                if (m.isPublic()) {
+                    result.add(new DefaultEntrypoint(m, cha));
+                }
+            }
+        }
+        return result;
+    }
